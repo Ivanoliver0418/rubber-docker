@@ -60,7 +60,7 @@ def create_container_root(image_name, image_dir, container_id, container_dir):
         # Fun fact: tar files may contain *nix devices! *facepalm*
         members = [m for m in t.getmembers()
                    if m.type not in (tarfile.CHRTYPE, tarfile.BLKTYPE)]
-        t.extractall(container_root, members=members)
+        t.extractall(container_root, members=members, filter='fully_trusted')
 
     return container_root
 
@@ -71,11 +71,18 @@ def cli():
 
 
 def contain(command, image_name, image_dir, container_id, container_dir):
-    # TODO: would you like to do something before chrooting?
-    # print('Created a new root fs for our container: {}'.format(new_root))
+    container_id = str(uuid.uuid4())
 
-    # TODO: chroot into new_root
-    # TODO: something after chrooting? (HINT: try running: python3 rd.py run -i ubuntu -- /bin/sh)
+    new_root = create_container_root (
+        image_name,
+        image_dir,
+        container_id,
+        container_dir
+        )
+    print('Created new root fs for out container:{}'.format(new_root))
+
+    os.chroot(new_root)
+    os.chdir("/")
 
     os.execvp(command[0], command)
 

@@ -1,92 +1,273 @@
-#!/usr/bin/env python3
-"""Docker From Scratch Workshop - Level 2: Adding mount namespace.
-
-Goal: Separate our mount table from the other processes.
-
-Usage:
-    running:
-        rd.py run -i ubuntu /bin/sh
-    will:
-        - fork a new chrooted process in a new mount namespace
 """
+rd.py - Tiny container runner for Rubber Docker: Mount Namespace
 
 
+Main ideas:
+    - Create a new root filesystem from an Ubuntu tar image.
+    - Start a child process using linux xlone().
+    - Put that child process in a new mount namespace using CLONE_NEWNS.
+    - Mount container-specific filesystems like /proc, /sys, /dev, and /dev/pts.
+    - Create basic device files like /dev/null and /dev/urandom.
+    - Use chroot() so the child process sees the extracted Ubuntu filesystem as /.
+    - Use execv() to replace the child Python process with the requested command.
 
-import linux
-import tarfile
-import uuid
+Note:
+    - This is not afully secured container yet
+    - chroot() changes the process's view of the filesystem, but it is not complete isolation
+    - Later levels improve this using pivot_root, PID namespaces, user namespaces, etc.
+"""
 
 import click
 import os
+import sys
+import tarfile
+import tempfile
 import traceback
+import uuid
+import stat
 
+# Import linux module is not a normal Python file in this folder.
+# It is acompiled extension module located in the project root:
+#   rubber-docker/linux.cpython-314-x86_64-linux-gnu.so
+# This module gives Python access to Linux system calls and constants such as:
+# linux.clone(). linux.mount(), linux.CLONE_NEWS, linux.MS_PRIVATE. linux.MS_REC
+# Project root was added to sys.path so Python imports teh correct Rubber Docker linux module
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+sys.path.insert(0, PROJECT_ROOT)
 
-def _get_image_path(image_name, image_dir, image_suffix='tar'):
-    return os.path.join(image_dir, os.extsep.join([image_name, image_suffix]))
+import linux
 
-
-def _get_container_path(container_id, container_dir, *subdir_names):
-    return os.path.join(container_dir, container_id, *subdir_names)
-
+# run using: sudo /home/ivan/Desktop/Projects/rubber-docker/.venv/bin/python rd.py run -i ubuntu /bin/bash
 
 def create_container_root(image_name, image_dir, container_id, container_dir):
-    image_path = _get_image_path(image_name, image_dir)
-    container_root = _get_container_path(container_id, container_dir, 'rootfs')
+    """
+    Create a new root filesystem for the container.
 
-    assert os.path.exists(image_path), "unable to locate image %s" % image_name
+    A container needs its own filesystem tree. In this project, the filesystem comes from a tar file,
+    for example:
+    /workshop/images/ubuntu.tar
 
-    if not os.path.exists(container_root):
-        os.makedirs(container_root)
+    This function extracts that image into a unique container directory:
+    /workshop/containers/<container_id>rootfs
 
+    After extraction rootfs directory will later become the container's "/" using chroot().
+    """
+
+    # Build path to the image tar file.
+    # image_dir = "/workshop/images"
+    # image_name = "ubuntu"
+    # image_path = /workshop/images/ubuntu.tar"
+    image_path = os.path.join(image_dir, image_name + '.tar')
+
+    # Build a unique container folder path
+    # /workshop/containers/ something uuid made
+    container_path = os.path.join(container_dir, container_id)
+
+    # The actual root filesystem goes inside the container folder.
+    # /workshop/containers/<id>/rootfs
+    container_root = os.path.join(container_path, 'rootfs')
+    
+    # Create the rootfs directory
+    os.makedirs(container_root)
+    
+    # Open the ubuntu imafe tar file.
     with tarfile.open(image_path) as t:
         # Fun fact: tar files may contain *nix devices! *facepalm*
+        # Tar files can contain special Unix device files. Ex. (character devices, block devices)
+        # Skipped because extracting device file directly from an image can be unsafe or awkward.
+        # Instead, later in contain(), we create only the basic device we need, /dev/null and /dev/urandom
         members = [m for m in t.getmembers()
                    if m.type not in (tarfile.CHRTYPE, tarfile.BLKTYPE)]
-        t.extractall(container_root, members=members)
 
+        # Python 3.14 blocks some rootfs symlinks by default,
+        # so we trust this image tar because it is our container image.
+        t.extractall(container_root, members=members, filter='fully_trusted')
+    
+    # Return the path to the extracted root filesystem.
     return container_root
 
 
 @click.group()
 def cli():
+    """
+    Main command group
+
+    This allows us to define subcommands such as:
+        
+        rd.py run -i ubuntu /bin/bash
+    """
     pass
 
 
 def contain(command, image_name, image_dir, container_id, container_dir):
+    """
+    Set up and run the container
+
+    This function runs inside the child process created by linux.clone()
+
+    This function:
+        - Create the root filesystem.
+        - set up private mounts.
+        - Mount /proc, /sys, /dev, and /dev/pts.
+        - Create basic device files
+        - chroot into new root filesystem
+        - execute the request command
+    """
+
+    # Create a fresh root filesystem for thsi container by extracting image.
     new_root = create_container_root(
         image_name, image_dir, container_id, container_dir)
+
     print('Created a new root fs for our container: {}'.format(new_root))
 
-    # TODO: time to say goodbye to the old mount namespace,
-    #       see "man 2 unshare" to get some help
-    #   HINT 1: there is no os.unshare(), time to use the linux module we made
-    #           just for you!
-    #   HINT 2: the linux module includes both functions and constants!
-    #           e.g. linux.CLONE_NEWNS
+    # Make  mount propagation private
+    # Mount propagation controls whether mount changes in one namespace spread into another namespace
+    # MS_PRIVATE means:
+    #   Mount changes here should not propagate somewhere else
+    # MS_REC means:
+    #   Apply this recursively to ecerything under /.
+    # Together:
+    #   Make / and all mounts under / private
 
-    # TODO: remember shared subtrees?
-    # (https://www.kernel.org/doc/Documentation/filesystems/sharedsubtree.txt)
-    # Make / a private mount to avoid littering our host mount table.
+    # This helps prevent the container's mountfrom leaking into the host's mount table
+    linux.mount(None, '/', None, linux.MS_REC | linux.MS_PRIVATE, None)
 
-    # Create mounts (/proc, /sys, /dev) under new_root
+    # Mount /proc inside the container root
+
+    # /proc is a virtual filesystem that exposes process and kernel information.
+    # Many Linux programs expect /proc to exist. For example:
+    #     cat /proc/self/mountinfo
+    # We mount it at:
+    #     new_root/proc
+    # After chroot(), the process sees that as:
+    #     /proc
+
     linux.mount('proc', os.path.join(new_root, 'proc'), 'proc', 0, '')
+
+    # Mount /sys inside the container root
+    
+    # /sys is another virtual filesystem. It exposes kernel and device
+    # information.
+    # We mount it at:
+    #     new_root/sys
+    # After chroot(), it appears as:
+    #     /sys
     linux.mount('sysfs', os.path.join(new_root, 'sys'), 'sysfs', 0, '')
+
+    # Mount /dev inside the container root
+
+    # /dev contains device files.
+    # Instead of using the host's /dev directly, we create a fresh tmpfs for
+    # the container's /dev.
+    # tmpfs means:
+    #     a temporary in-memory filesystem.
+    # MS_NOSUID means:
+    #     ignore set-user-ID bits on this mount, which is safer.
+    # mode=755 sets the permissions for the /dev directory.
     linux.mount('tmpfs', os.path.join(new_root, 'dev'), 'tmpfs',
                 linux.MS_NOSUID | linux.MS_STRICTATIME, 'mode=755')
-    # Add some basic devices
+
+    # Mount /dev/pts
+   
+    # /dev/pts is used for pseudo-terminals.
+    # When you open a terminal, Linux uses pseudo-terminal devices like:
+    #     /dev/pts/0
+    # Mounting devpts helps terminal-related programs work correctly inside
+    # the container.
+    devpts_path = os.path.join(new_root, 'dev', 'pts')
+
+    if not os.path.exists(devpts_path):
+        os.makedirs(devpts_path)
+
+    linux.mount('devpts', devpts_path, 'devpts', 0, '')
     devpts_path = os.path.join(new_root, 'dev', 'pts')
     if not os.path.exists(devpts_path):
         os.makedirs(devpts_path)
-        linux.mount('devpts', devpts_path, 'devpts', 0, '')
+
+    linux.mount('devpts', devpts_path, 'devpts', 0, '')
+
+    # Create /dev/stdin, /dev/stdout, and /dev/stderr
+    
+    # Linux programs commonly expect these files:
+    #     /dev/stdin
+    #     /dev/stdout
+    #     /dev/stderr
+    # They are symbolic links to the current process's file descriptors:
+    #     /proc/self/fd/0  -> standard input
+    #     /proc/self/fd/1  -> standard output
+    #     /proc/self/fd/2  -> standard error
+    # This lets programs inside the container use normal input/output.
     for i, dev in enumerate(['stdin', 'stdout', 'stderr']):
-        os.symlink('/proc/self/fd/%d' % i, os.path.join(new_root, 'dev', dev))
+        dev_path = os.path.join(new_root, 'dev', dev)
 
-    # TODO: add more devices (e.g. null, zero, random, urandom) using os.mknod.
+        if not os.path.exists(dev_path):
+            os.symlink('/proc/self/fd/%d' % i, dev_path)
 
+    # Create basic device files
+ 
+    # The image extraction skipped device files, so we manually create a few
+    # safe and useful ones.
+    # os.mknod() creates filesystem nodes
+    # stat.S_IFCHR means:
+    #     create a character device.
+    # os.makedev(major, minor) creates a device number.
+    # Common Linux device numbers:
+    #     /dev/null     = major 1, minor 3
+    #     /dev/zero     = major 1, minor 5
+    #     /dev/random   = major 1, minor 8
+    #     /dev/urandom  = major 1, minor 9
+    # 0o666 means:
+    #     readable and writable by everyone.
+
+    # /dev/null discards anything written to it.
+    os.mknod(os.path.join(new_root, 'dev', 'null'),
+             0o666 | stat.S_IFCHR, os.makedev(1, 3))
+    
+    # /dev/zero produces endless zero bytes when read.
+    os.mknod(os.path.join(new_root, 'dev', 'zero'),
+             0o666 | stat.S_IFCHR, os.makedev(1, 5))
+    
+    # /dev/random produces random bytes
+    os.mknod(os.path.join(new_root, 'dev', 'random'),
+             0o666 | stat.S_IFCHR, os.makedev(1, 8))
+    
+    # /dev/urandom produces random bytes
+    os.mknod(os.path.join(new_root, 'dev', 'urandom'),
+             0o666 | stat.S_IFCHR, os.makedev(1, 9))
+
+    # Change the process root using chroot()
+    
+    # Before chroot():
+    #     / means the host's root filesystem.
+    # After chroot(new_root):
+    #     / means the container root filesystem.
+    # Example:
+    #     new_root = /workshop/containers/<id>/rootfs
+    # After chroot, when the process runs:
+    #     ls /
+    # it sees:
+    #     /bin /etc /usr /proc /sys /dev ...
+    # from the extracted Ubuntu image.
+    # Note:
+    #     chroot is not complete security by itself. Later levels improve this
+    #     using pivot_root and more namespaces.
     os.chroot(new_root)
 
+    # Move into the new root directory.
+    # This is important because after chroot(), the process should not keep its
+    # current working directory outside the new root.
     os.chdir('/')
 
+    # Execute the requested command
+    
+    # execvp() replaces the current child Python process with another program.
+    # If the user ran:
+    #     rd.py run -i ubuntu /bin/bash
+    # then:
+    #     command[0] = "/bin/bash"
+    #     command    = ("/bin/bash",)
+    # After this line, the child process is no longer running Python.
+    # It becomes /bin/bash inside the container.
     os.execvp(command[0], command)
 
 
@@ -98,19 +279,54 @@ def contain(command, image_name, image_dir, container_id, container_dir):
               default='/workshop/containers')
 @click.argument('Command', required=True, nargs=-1)
 def run(image_name, image_dir, container_dir, command):
+    """
+    Run a command inside a minimal container.
+
+    Example:
+
+        sudo python rd.py run -i ubuntu /bin/bash
+
+    The command-line options mean:
+
+        -i ubuntu
+            Use /workshop/images/ubuntu.tar as the image.
+
+        /bin/bash
+            Run /bin/bash inside the container.
+
+    This function creates a child process with a new mount namespace and then
+    waits for that child process to exit.
+    """
+
+    # Create a unique container ID so each run gets its own rootfs directory.
     container_id = str(uuid.uuid4())
 
-    pid = os.fork()
-    if pid == 0:
-        # This is the child, we'll try to do some containment here
-        try:
-            contain(command, image_name, image_dir, container_id, container_dir)
-        except Exception:
-            traceback.print_exc()
-            os._exit(1)  # something went wrong in contain()
+    # Create the container process
+   
+    # linux.clone() is similar to fork(), but it allows us to request specific
+    # Linux namespace isolation.
+    # Here we pass:
+    #     contain
+    #         The function the child process should run.
+    #     linux.CLONE_NEWNS
+    #         Create a new mount namespace for the child.
+    #     (command, image_name, image_dir, container_id, container_dir)
+    #         Arguments passed into contain().
+    # A mount namespace controls what mounts a process can see.
+    # Because the child has its own mount namespace, the container can mount
+    # /proc, /sys, and /dev without directly changing the host's mount view.
+    pid = linux.clone(
+        contain,
+        linux.CLONE_NEWNS,
+        (command, image_name, image_dir, container_id, container_dir)
+    )
 
-    # This is the parent, pid contains the PID of the forked process
-    # wait for the forked child, fetch the exit status
+    # Parent waits for the container process
+    
+    # The parent process waits until the child process exits.
+    # If the child process runs /bin/bash, this line waits until you type:
+    #     exit
+    # inside the container shell.
     _, status = os.waitpid(pid, 0)
     print('{} exited with status {}'.format(pid, status))
 
